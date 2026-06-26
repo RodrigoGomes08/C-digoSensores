@@ -1,19 +1,12 @@
 /*
  * ======================================================
- *  IR RECEIVER + WiFi + RGB LED + Speaker + APDS-9960
- *  Arduino UNO R4 WiFi
- * ======================================================
- * Bibliotecas necessárias:
- *   - IRremote (v3.x)
- *   - WiFiS3 (já incluída no core do UNO R4 WiFi)
- *   - ChainableLED ("Grove Chainable RGB LED")
- *   - SparkFun_APDS9960
+ * IR RECEIVER + WiFi + GROVE RGB LED + Speaker + APDS-9960
+ * Arduino UNO R4 WiFi — Correção de Cor por Proximidade Local
  * ======================================================
  */
 
 #include <IRremote.hpp>
 #include <WiFiS3.h>
-#include <ChainableLED.h>
 #include <SparkFun_APDS9960.h>
 #include <Wire.h>
 
@@ -30,19 +23,21 @@ WiFiClient client;
 #define ADDR_ESPERADO  0x42
 #define MAX_MATRICULA  16
 
-// ─── RGB LED (Grove Chainable — porta D6) ─────────────
-ChainableLED led(6, 7, 1);
+// ─── Grove Chainable RGB LED (Porta D6) ────────────────
+#define CLK_PIN   6
+#define DATA_PIN  7
 
 // ─── Speaker (porta D4) ───────────────────────────────
 #define SPEAKER_PIN 4
 
 // ─── APDS-9960 ────────────────────────────────────────
 SparkFun_APDS9960 apds;
-#define PROX_LIMITE      50    // acima disto = ocupado
-#define INTERVALO_PROX   2000  // envia estado a cada 2s (igual ao FSR)
+#define LIMITE_ALTO      60    
+#define LIMITE_BAIXO     35    
+#define INTERVALO_PROX   2000  
 
 // ─── id do lugar (atualizado quando chega IR) ─────────
-uint8_t id_lugar_atual = 4;  // valor por defeito
+uint8_t id_lugar_atual = 4;  
 
 // ─── Máquina de estados IR ────────────────────────────
 enum EstadoTrama {
@@ -61,7 +56,7 @@ char        matricula[MAX_MATRICULA + 1];
 uint8_t     checksum  = 0;
 
 // ─── Estado LED e Buzzer ──────────────────────────────
-enum EstadoLED { LED_OFF, LED_AZUL, LED_VERDE, LED_VERMELHO_PISCAR };
+enum EstadoLED { LED_OFF, LED_AZUL, LED_VERDE, LED_VERMELHO_PISCAR, LED_VERMELHO_FIXO };
 EstadoLED     estadoLED    = LED_OFF;
 unsigned long ultimoBlink  = 0;
 bool          blinkLigado  = false;
@@ -70,8 +65,20 @@ unsigned long ultimoBuzzer = 0;
 bool          buzzerLigado = false;
 
 // ─── Controlo de envio de proximidade ─────────────────
-unsigned long ultimoEnvioProx  = 0;
-int           ultimoEstadoLugar = -1; // -1 = nunca enviado
+unsigned long ultimoEnvioProx   = 0;
+int           ultimoEstadoLugar = -1; 
+
+// Protótipos de funções
+void atualizarLED();
+void atualizarBuzzer();
+void enviarEstadoLugar();
+void processarByte(uint8_t b);
+void resetarEstado();
+void enviarMatriculaAPI(uint8_t idLugar, const char* mat);
+void ligarWiFi();
+String extrairCampoJSON(String json, String campo);
+void sendGroveByte(uint8_t b);
+void setGroveLEDColor(uint8_t r, uint8_t g, uint8_t b);
 
 // ──────────────────────────────────────────────────────
 //  SETUP
@@ -84,8 +91,16 @@ void setup() {
   pinMode(SPEAKER_PIN, OUTPUT);
   digitalWrite(SPEAKER_PIN, LOW);
 
-  led.init();
-  setLED(LED_OFF);
+  pinMode(CLK_PIN, OUTPUT);
+  pinMode(DATA_PIN, OUTPUT);
+  digitalWrite(CLK_PIN, LOW);
+  digitalWrite(DATA_PIN, LOW);
+  
+  delay(500); 
+
+  // Inicia explicitamente em VERDE (Livre)
+  estadoLED = LED_VERDE; 
+  atualizarLED(); 
 
   Wire.begin();
   if (!apds.init()) {
@@ -126,19 +141,38 @@ void loop() {
 }
 
 // ──────────────────────────────────────────────────────
-//  APDS-9960 — envia estado do lugar para a API
+//  APDS-9960 — Determina a cor e envia estado para a API
 // ──────────────────────────────────────────────────────
 void enviarEstadoLugar() {
   uint8_t proximidade = 0;
   apds.readProximity(proximidade);
-  int ocupado = (proximidade > PROX_LIMITE) ? 1 : 0;
+  
+  int ocupado = ultimoEstadoLugar;
+  if (proximidade > LIMITE_ALTO) {
+    ocupado = 1;
+  } else if (proximidade < LIMITE_BAIXO) {
+    ocupado = 0;
+  }
+  
+  if (ocupado == -1) ocupado = 0;
 
   Serial.print("[APDS] proximidade=");
   Serial.print(proximidade);
   Serial.print(" -> ");
   Serial.println(ocupado ? "OCUPADO" : "VAZIO");
 
-  // Só envia se o estado mudou (igual ao LIMIAR_MUDANCA do FSR)
+  // CORREÇÃO: Altera o estado do LED localmente de forma imediata!
+  if (ocupado == 1) {
+    // Se a API não mudou o LED para azul (reserva) nem para piscar (erro), aplica Vermelho Fixo
+    if (estadoLED != LED_AZUL && estadoLED != LED_VERMELHO_PISCAR) {
+      estadoLED = LED_VERMELHO_FIXO;
+    }
+  } else {
+    // Se o lugar está vazio, volta sempre a ficar Verde
+    estadoLED = LED_VERDE;
+  }
+
+  // Só avança para o envio Wi-Fi se o estado mudou na base de dados
   if (ocupado == ultimoEstadoLugar) return;
   ultimoEstadoLugar = ocupado;
 
@@ -147,13 +181,7 @@ void enviarEstadoLugar() {
     return;
   }
 
-  char body[40];
-  snprintf(body, sizeof(body), "{\"ocupado\":%d}", ocupado);
-  int bodyLen = strlen(body);
-
-  char rota[40];
-  snprintf(rota, sizeof(rota), "/api/lugar/ocupar/%d", id_lugar_atual);
-  // Se ocupado envia /lugar/ocupar/X, se vazio envia /lugar/desocupar/X
+  char rota[50];
   if (ocupado) {
     snprintf(rota, sizeof(rota), "/api/lugar/ocupar/%d", id_lugar_atual);
   } else {
@@ -166,11 +194,9 @@ void enviarEstadoLugar() {
   client.print("\r\n");
 
   unsigned long timeout = millis();
-  String resposta = "";
   while (client.connected() || client.available()) {
     while (client.available()) {
-      char c = client.read();
-      resposta += c;
+      client.read(); 
       timeout = millis();
     }
     if (millis() - timeout > 5000) break;
@@ -226,7 +252,7 @@ void processarByte(uint8_t b) {
       if (b == checksum) {
         Serial.print("[IR] Matricula: "); Serial.println(matricula);
         Serial.print("[IR] id_lugar: "); Serial.println(id_lugar);
-        id_lugar_atual = id_lugar; // atualiza o lugar ativo
+        id_lugar_atual = id_lugar; 
         enviarMatriculaAPI(id_lugar, matricula);
       } else {
         Serial.println("[IR] Checksum invalido.");
@@ -306,26 +332,65 @@ void enviarMatriculaAPI(uint8_t idLugar, const char* mat) {
 }
 
 // ──────────────────────────────────────────────────────
-//  LED RGB
+//  MÉTODO DE SUPORTE GROVE LED (P9813) — EMULAÇÃO UNO R4
 // ──────────────────────────────────────────────────────
-void setLED(EstadoLED e) {
-  switch (e) {
-    case LED_OFF:             led.setColorRGB(0, 0,   0,   0);   break;
-    case LED_AZUL:            led.setColorRGB(0, 0,   0,   255); break;
-    case LED_VERDE:           led.setColorRGB(0, 0,   255, 0);   break;
-    case LED_VERMELHO_PISCAR: led.setColorRGB(0, 255, 0,   0);   break;
+void sendGroveByte(uint8_t b) {
+  for (int i = 7; i >= 0; i--) {
+    digitalWrite(DATA_PIN, (b >> i) & 0x01);
+    delayMicroseconds(2); 
+    digitalWrite(CLK_PIN, HIGH);
+    delayMicroseconds(2);
+    digitalWrite(CLK_PIN, LOW);
+    delayMicroseconds(2);
   }
 }
+
+void setGroveLEDColor(uint8_t r, uint8_t g, uint8_t b) {
+  uint8_t checksum = 0xC0;
+  if ((b & 0x80) == 0) checksum |= 0x20;
+  if ((b & 0x40) == 0) checksum |= 0x10;
+  if ((g & 0x80) == 0) checksum |= 0x08;
+  if ((g & 0x40) == 0) checksum |= 0x04;
+  if ((r & 0x80) == 0) checksum |= 0x02;
+  if ((r & 0x40) == 0) checksum |= 0x01;
+
+  for (int i = 0; i < 4; i++) sendGroveByte(0x00);
+  sendGroveByte(checksum);
+  sendGroveByte(b); 
+  sendGroveByte(g);
+  sendGroveByte(r);
+  for (int i = 0; i < 4; i++) sendGroveByte(0x00);
+}
+
+// ──────────────────────────────────────────────────────
+//  GERENCIAMENTO LED RGB
+// ──────────────────────────────────────────────────────
+EstadoLED ultimoEstadoLED = LED_OFF; 
 
 void atualizarLED() {
   if (estadoLED == LED_VERMELHO_PISCAR) {
     if (millis() - ultimoBlink > 400) {
       ultimoBlink = millis();
       blinkLigado = !blinkLigado;
-      led.setColorRGB(0, blinkLigado ? 255 : 0, 0, 0);
+      if (blinkLigado) {
+        setGroveLEDColor(255, 0, 0); 
+      } else {
+        setGroveLEDColor(0, 0, 0);   
+      }
     }
+    ultimoEstadoLED = LED_VERMELHO_PISCAR;
+
   } else {
-    setLED(estadoLED);
+    if (estadoLED != ultimoEstadoLED) {
+      ultimoEstadoLED = estadoLED;
+      switch (estadoLED) {
+        case LED_OFF:           setGroveLEDColor(0, 0, 0);     break;
+        case LED_AZUL:          setGroveLEDColor(0, 0, 255);   break;
+        case LED_VERDE:         setGroveLEDColor(0, 255, 0);   break;
+        case LED_VERMELHO_FIXO: setGroveLEDColor(255, 0, 0);   break; // Adicionado Vermelho Fixo local
+        default: break;
+      }
+    }
   }
 }
 
