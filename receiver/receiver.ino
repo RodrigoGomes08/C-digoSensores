@@ -6,8 +6,8 @@
  * Bibliotecas necessárias:
  *   - IRremote (v3.x)
  *   - WiFiS3 (já incluída no core do UNO R4 WiFi)
- *   - ChainableLED (instalar via Library Manager: "Grove Chainable RGB LED")
- *   - SparkFun_APDS9960 (instalar via Library Manager: "SparkFun APDS9960")
+ *   - ChainableLED ("Grove Chainable RGB LED")
+ *   - SparkFun_APDS9960
  * ======================================================
  */
 
@@ -20,7 +20,7 @@
 // ─── WiFi ─────────────────────────────────────────────
 char ssid[] = "OPPO A78 5G";
 char pass[] = "i5y644cy";
-char host[] = "10.177.35.66";
+char host[] = "10.197.187.66";
 int  port   = 8081;
 WiFiClient client;
 
@@ -31,15 +31,18 @@ WiFiClient client;
 #define MAX_MATRICULA  16
 
 // ─── RGB LED (Grove Chainable — porta D6) ─────────────
-// D6 = CLK, D7 = DATA  (o Grove usa os 2 pinos da porta)
-ChainableLED led(6, 7, 1);  // (CLK, DATA, nº de LEDs)
+ChainableLED led(6, 7, 1);
 
 // ─── Speaker (porta D4) ───────────────────────────────
 #define SPEAKER_PIN 4
 
-// ─── APDS-9960 (porta I2C) ────────────────────────────
+// ─── APDS-9960 ────────────────────────────────────────
 SparkFun_APDS9960 apds;
-#define DIST_LIMITE  50  // valor de proximidade acima do qual considera "ocupado" (0-255)
+#define PROX_LIMITE      50    // acima disto = ocupado
+#define INTERVALO_PROX   2000  // envia estado a cada 2s (igual ao FSR)
+
+// ─── id do lugar (atualizado quando chega IR) ─────────
+uint8_t id_lugar_atual = 4;  // valor por defeito
 
 // ─── Máquina de estados IR ────────────────────────────
 enum EstadoTrama {
@@ -66,6 +69,10 @@ bool          buzzerAtivo  = false;
 unsigned long ultimoBuzzer = 0;
 bool          buzzerLigado = false;
 
+// ─── Controlo de envio de proximidade ─────────────────
+unsigned long ultimoEnvioProx  = 0;
+int           ultimoEstadoLugar = -1; // -1 = nunca enviado
+
 // ──────────────────────────────────────────────────────
 //  SETUP
 // ──────────────────────────────────────────────────────
@@ -74,30 +81,24 @@ void setup() {
   while (!Serial) { delay(10); }
   Serial.println("=== RECEIVER A INICIAR ===");
 
-  // Speaker
   pinMode(SPEAKER_PIN, OUTPUT);
   digitalWrite(SPEAKER_PIN, LOW);
 
-  // LED
   led.init();
   setLED(LED_OFF);
 
-  // APDS-9960
   Wire.begin();
   if (!apds.init()) {
-    Serial.println("[APDS] Falha ao iniciar! Verifica ligacao I2C.");
+    Serial.println("[APDS] Falha ao iniciar!");
   } else {
     apds.enableProximitySensor(false);
-    Serial.println("[APDS] Sensor de proximidade OK");
+    Serial.println("[APDS] OK");
   }
 
-  // IR
   IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
-  Serial.println("[IR] Receiver OK");
+  Serial.println("[IR] OK");
 
-  // WiFi
   ligarWiFi();
-
   Serial.println("=== RECEIVER PRONTO ===");
 }
 
@@ -109,17 +110,75 @@ void loop() {
   if (IrReceiver.decode()) {
     uint16_t addr = IrReceiver.decodedIRData.address;
     uint8_t  cmd  = (uint8_t)IrReceiver.decodedIRData.command;
-
-    if (addr == ADDR_ESPERADO) {
-      processarByte(cmd);
-    }
-
+    if (addr == ADDR_ESPERADO) processarByte(cmd);
     IrReceiver.resume();
   }
 
-  // 2. Atualiza LED e buzzer (non-blocking)
+  // 2. Envia estado do lugar periodicamente via proximidade
+  if (millis() - ultimoEnvioProx >= INTERVALO_PROX) {
+    ultimoEnvioProx = millis();
+    enviarEstadoLugar();
+  }
+
+  // 3. Atualiza LED e buzzer
   atualizarLED();
   atualizarBuzzer();
+}
+
+// ──────────────────────────────────────────────────────
+//  APDS-9960 — envia estado do lugar para a API
+// ──────────────────────────────────────────────────────
+void enviarEstadoLugar() {
+  uint8_t proximidade = 0;
+  apds.readProximity(proximidade);
+  int ocupado = (proximidade > PROX_LIMITE) ? 1 : 0;
+
+  Serial.print("[APDS] proximidade=");
+  Serial.print(proximidade);
+  Serial.print(" -> ");
+  Serial.println(ocupado ? "OCUPADO" : "VAZIO");
+
+  // Só envia se o estado mudou (igual ao LIMIAR_MUDANCA do FSR)
+  if (ocupado == ultimoEstadoLugar) return;
+  ultimoEstadoLugar = ocupado;
+
+  if (!client.connect(host, port)) {
+    Serial.println("[LUGAR][ERRO] Falha ao conectar.");
+    return;
+  }
+
+  char body[40];
+  snprintf(body, sizeof(body), "{\"ocupado\":%d}", ocupado);
+  int bodyLen = strlen(body);
+
+  char rota[40];
+  snprintf(rota, sizeof(rota), "/api/lugar/ocupar/%d", id_lugar_atual);
+  // Se ocupado envia /lugar/ocupar/X, se vazio envia /lugar/desocupar/X
+  if (ocupado) {
+    snprintf(rota, sizeof(rota), "/api/lugar/ocupar/%d", id_lugar_atual);
+  } else {
+    snprintf(rota, sizeof(rota), "/api/lugar/desocupar/%d", id_lugar_atual);
+  }
+
+  client.print("GET "); client.print(rota); client.print(" HTTP/1.1\r\n");
+  client.print("Host: "); client.print(host); client.print("\r\n");
+  client.print("Connection: close\r\n");
+  client.print("\r\n");
+
+  unsigned long timeout = millis();
+  String resposta = "";
+  while (client.connected() || client.available()) {
+    while (client.available()) {
+      char c = client.read();
+      resposta += c;
+      timeout = millis();
+    }
+    if (millis() - timeout > 5000) break;
+  }
+  client.stop();
+
+  Serial.print("[LUGAR] Enviado -> ");
+  Serial.println(rota);
 }
 
 // ──────────────────────────────────────────────────────
@@ -127,7 +186,6 @@ void loop() {
 // ──────────────────────────────────────────────────────
 void processarByte(uint8_t b) {
   switch (estado) {
-
     case AGUARDA_START:
       if (b == START_BYTE) {
         checksum = START_BYTE;
@@ -166,11 +224,12 @@ void processarByte(uint8_t b) {
 
     case AGUARDA_CHECKSUM:
       if (b == checksum) {
-        Serial.print("[IR] Matricula recebida: "); Serial.println(matricula);
-        Serial.print("[IR] id_lugar: ");           Serial.println(id_lugar);
+        Serial.print("[IR] Matricula: "); Serial.println(matricula);
+        Serial.print("[IR] id_lugar: "); Serial.println(id_lugar);
+        id_lugar_atual = id_lugar; // atualiza o lugar ativo
         enviarMatriculaAPI(id_lugar, matricula);
       } else {
-        Serial.println("[IR] Checksum invalido. A ignorar.");
+        Serial.println("[IR] Checksum invalido.");
       }
       resetarEstado();
       break;
@@ -187,7 +246,7 @@ void resetarEstado() {
 }
 
 // ──────────────────────────────────────────────────────
-//  API — Envia matrícula e processa resposta
+//  API — Envia matrícula
 // ──────────────────────────────────────────────────────
 void enviarMatriculaAPI(uint8_t idLugar, const char* mat) {
   Serial.println("[API] A enviar matricula...");
@@ -209,7 +268,6 @@ void enviarMatriculaAPI(uint8_t idLugar, const char* mat) {
   client.print("\r\n");
   client.print(body);
 
-  // Lê resposta
   String resposta = "";
   unsigned long timeout = millis();
   while (client.connected() || client.available()) {
@@ -225,33 +283,21 @@ void enviarMatriculaAPI(uint8_t idLugar, const char* mat) {
   Serial.println("[API] Resposta:");
   Serial.println(resposta);
 
-  // Extrai "resultado" do JSON
   String resultado = extrairCampoJSON(resposta, "resultado");
   Serial.print("[API] resultado = "); Serial.println(resultado);
 
-  // Lê proximidade do APDS-9960
-  uint8_t proximidade = 0;
-  apds.readProximity(proximidade);
-  bool lugarOcupado = (proximidade > DIST_LIMITE);
-  Serial.print("[APDS] proximidade = "); Serial.print(proximidade);
-  Serial.println(lugarOcupado ? " -> OCUPADO" : " -> VAZIO");
-
-  // ─── Decide ação ────────────────────────────────────
   if (resultado == "sem_reserva") {
     Serial.println("[ACAO] Sem reserva -> LED verde");
     estadoLED   = LED_VERDE;
     buzzerAtivo = false;
-
   } else if (resultado == "match") {
     Serial.println("[ACAO] Matricula correta -> LED azul");
     estadoLED   = LED_AZUL;
     buzzerAtivo = false;
-
   } else if (resultado == "mismatch") {
     Serial.println("[ACAO] Matricula errada -> LED vermelho + buzzer");
     estadoLED   = LED_VERMELHO_PISCAR;
     buzzerAtivo = true;
-
   } else {
     Serial.println("[ACAO] Resposta desconhecida.");
     estadoLED   = LED_OFF;
@@ -260,14 +306,14 @@ void enviarMatriculaAPI(uint8_t idLugar, const char* mat) {
 }
 
 // ──────────────────────────────────────────────────────
-//  LED RGB (Grove Chainable P9813)
+//  LED RGB
 // ──────────────────────────────────────────────────────
-void setLED(EstadoLED estado) {
-  switch (estado) {
-    case LED_OFF:              led.setColorRGB(0, 0,   0,   0);   break;
-    case LED_AZUL:             led.setColorRGB(0, 0,   0,   255); break;
-    case LED_VERDE:            led.setColorRGB(0, 0,   255, 0);   break;
-    case LED_VERMELHO_PISCAR:  led.setColorRGB(0, 255, 0,   0);   break;
+void setLED(EstadoLED e) {
+  switch (e) {
+    case LED_OFF:             led.setColorRGB(0, 0,   0,   0);   break;
+    case LED_AZUL:            led.setColorRGB(0, 0,   0,   255); break;
+    case LED_VERDE:           led.setColorRGB(0, 0,   255, 0);   break;
+    case LED_VERMELHO_PISCAR: led.setColorRGB(0, 255, 0,   0);   break;
   }
 }
 
@@ -276,8 +322,7 @@ void atualizarLED() {
     if (millis() - ultimoBlink > 400) {
       ultimoBlink = millis();
       blinkLigado = !blinkLigado;
-      if (blinkLigado) led.setColorRGB(0, 255, 0, 0);
-      else             led.setColorRGB(0, 0,   0, 0);
+      led.setColorRGB(0, blinkLigado ? 255 : 0, 0, 0);
     }
   } else {
     setLED(estadoLED);
@@ -285,7 +330,7 @@ void atualizarLED() {
 }
 
 // ──────────────────────────────────────────────────────
-//  Buzzer (non-blocking)
+//  Buzzer
 // ──────────────────────────────────────────────────────
 void atualizarBuzzer() {
   if (!buzzerAtivo) {
@@ -314,7 +359,7 @@ void ligarWiFi() {
 }
 
 // ──────────────────────────────────────────────────────
-//  Extrai valor de campo JSON
+//  Extrai campo JSON
 // ──────────────────────────────────────────────────────
 String extrairCampoJSON(String json, String campo) {
   String chave = "\"" + campo + "\":\"";

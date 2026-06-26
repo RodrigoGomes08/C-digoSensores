@@ -30,8 +30,8 @@ bool cancelaAberta    = false;
 bool objetoDetectado  = false;
 
 // ─── Dados a enviar ───────────────────────────────────
-uint8_t id_lugar  = 5;
-String  matricula = "AA-00-BB";
+uint8_t id_lugar  = 4;
+String  matricula = "12-AB-34";
 // ──────────────────────────────────────────────────────
 
 void setup() {
@@ -112,6 +112,11 @@ void enviarDados(uint8_t idLugar, String mat) {
     checksum ^= c;
   }
   trama[idx++] = checksum;
+
+  Serial.print("[IR] A enviar: id_lugar=");
+  Serial.print(idLugar);
+  Serial.print(" | matricula=");
+  Serial.println(mat);
 
   for (uint8_t i = 0; i < idx; i++) {
     IrSender.sendNEC(0x42, trama[i], 0);
