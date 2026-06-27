@@ -11,12 +11,20 @@
 #include <Wire.h>
 
 // ─── WiFi ─────────────────────────────────────────────
-char ssid[] = "OPPO A78 5G";
+char ssid[] = "OPPO A78 5G"; //Coloca o mesmo wifi do arduino
 char pass[] = "i5y644cy";
-char host[] = "10.197.187.66";
-int  port   = 8081;
+
+// 1. Liga o pc que estás á mesma rede que vais ligar o arduino, ou seja a que está em cima
+// 2. Abre o terminal e escreve ipconfig e copia o IP que está aqui Wireless LAN adapter Wi-Fi
+// 3. Cola esse IP na linha abaixo(host)
+char host[] = "10.197.187.66"; 
+int  port   = 8081;            
 WiFiClient client;
 
+// 4. Depois de fazeres isso vai ao VSCode e na pasta mydev.techurbis.com clica com o btn direito e clica no open a integrated terminal e cola este comando php composer.phar install
+// 5. Ainda no mesmo terminal cola este comando php -S 0.0.0.0:8081 -t public e a resposta tem de ser parecida com esta [Sat Jun 27 11:25:30 2026] PHP 8.3.30 Development Server (http://0.0.0.0:8081) started
+// 6. Liga o arduino e abre o serial monitor que é aquela lupinha em cima á esquerda e confirma se está tudo a correr bem
+  
 // ─── IR Receiver ──────────────────────────────────────
 #define IR_RECEIVE_PIN 2
 #define START_BYTE     0xFF
@@ -121,7 +129,7 @@ void setup() {
 //  LOOP
 // ──────────────────────────────────────────────────────
 void loop() {
-  // 1. Recebe IR
+  // 1. Recebe IR, ele recebe a mensagem aos poucos, não recebe tudo de uma vez
   if (IrReceiver.decode()) {
     uint16_t addr = IrReceiver.decodedIRData.address;
     uint8_t  cmd  = (uint8_t)IrReceiver.decodedIRData.command;
@@ -210,9 +218,10 @@ void enviarEstadoLugar() {
 // ──────────────────────────────────────────────────────
 //  IR — Máquina de estados
 // ──────────────────────────────────────────────────────
+// Cada byte que chega passa por esta função
 void processarByte(uint8_t b) {
   switch (estado) {
-    case AGUARDA_START:
+    case AGUARDA_START: // encontrou o inicio
       if (b == START_BYTE) {
         checksum = START_BYTE;
         estado   = AGUARDA_ID_LUGAR;
@@ -220,14 +229,14 @@ void processarByte(uint8_t b) {
       }
       break;
 
-    case AGUARDA_ID_LUGAR:
+    case AGUARDA_ID_LUGAR: // guardou o id_lugar
       id_lugar  = b;
       checksum ^= b;
       estado    = AGUARDA_LEN;
       Serial.print("[IR] id_lugar = "); Serial.println(id_lugar);
       break;
 
-    case AGUARDA_LEN:
+    case AGUARDA_LEN: // Sabe quantas letras veem e vê se o comprimento é inválido ou não
       if (b == 0 || b > MAX_MATRICULA) {
         Serial.println("[IR] Comprimento invalido. A resetar.");
         resetarEstado();
@@ -239,7 +248,7 @@ void processarByte(uint8_t b) {
       estado    = AGUARDA_CHARS;
       break;
 
-    case AGUARDA_CHARS:
+    case AGUARDA_CHARS: // monta a matricula letra a letra
       matricula[chars_rec++] = (char)b;
       checksum ^= b;
       if (chars_rec >= len_mat) {
@@ -248,7 +257,7 @@ void processarByte(uint8_t b) {
       }
       break;
 
-    case AGUARDA_CHECKSUM:
+    case AGUARDA_CHECKSUM: // como a mensagem é valida envia para a API
       if (b == checksum) {
         Serial.print("[IR] Matricula: "); Serial.println(matricula);
         Serial.print("[IR] id_lugar: "); Serial.println(id_lugar);
@@ -277,22 +286,26 @@ void resetarEstado() {
 void enviarMatriculaAPI(uint8_t idLugar, const char* mat) {
   Serial.println("[API] A enviar matricula...");
 
+  // Liga ao servidor
   if (!client.connect(host, port)) {
     Serial.println("[API][ERRO] Falha ao conectar.");
     return;
   }
 
+  // Cria o JSON, da mesma forma como a API está pronta para o receber
+  // Exemplo: {"id_lugar":4,"matricula":"12-AB-34"}
   char body[60];
   snprintf(body, sizeof(body), "{\"id_lugar\":%d,\"matricula\":\"%s\"}", idLugar, mat);
   int bodyLen = strlen(body);
 
+  //Envia o pedido HTTP manualmente
   client.print("POST /api/sensor/valor-matricula HTTP/1.1\r\n");
   client.print("Host: "); client.print(host); client.print("\r\n");
   client.print("Content-Type: application/json\r\n");
-  client.print("Content-Length: "); client.print(bodyLen); client.print("\r\n");
+  client.print("Content-Length: "); client.print(bodyLen); client.print("\r\n"); // tamanho do body
   client.print("Connection: close\r\n");
   client.print("\r\n");
-  client.print(body);
+  client.print(body);// envia o json
 
   String resposta = "";
   unsigned long timeout = millis();
